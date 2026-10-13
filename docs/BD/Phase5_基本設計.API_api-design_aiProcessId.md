@@ -70,7 +70,7 @@ Request／Responseのクラス名、厳密なJSON Schema、タイムアウト値
 - 親organization変更（移動）
 - organization削除
 
-各操作の最終URIとRequest／Response形式は、元のPhase 5-2最終版との照合後に確定する。Phase 6で新規に仕様を追加するのではなく、画面設計に必要な責務を維持する。
+Organization詳細設計書で、`GET /organizations/tree`、`POST /organizations`、`PATCH /organizations/{id}/name`、`PATCH /organizations/{id}/parent`、`GET /organizations/{id}/deletion-check`、`DELETE /organizations/{id}` に確定した。Request／Response形式は同詳細設計書を正とする。
 
 ## 5. メモAPI詳細
 
@@ -405,18 +405,29 @@ Responseでは、少なくとも次の情報を区別して返す。
 
 ## 10. Phase 6への申し送り
 
-- organization管理APIの最終URI、HTTPメソッドおよびJSON形式
+- organization管理APIのURI・HTTPメソッドはOrganization詳細設計書で確定済み。Request／Response形式は同書に従い、共通エラー形式との整合のみ実装時に確認
 - AI提案「使わない」専用APIの最終URI
 - 全APIの厳密なRequest／Response例
 - ページング・並び順
 - 検索APIの厳密なResponse形式、空`q`の入力検証
 - 検索実装におけるRepository参照方法と重複排除方法
-- CSRF対策を含むSession＋Cookieの具体設定
-- 内部APIキーヘッダー名とローテーション方法
+- Session＋Cookie／CSRFは§10.1のWave 0-A方針を採用。トークン配布APIなどは認証実装前に確定
+- 内部APIキーヘッダー・外部設定は§10.1に確定。自動ローテーションはMVP対象外
 - 非同期実行方式
 - outdated判定に必要な具体フィールド
 - タイムアウト扱い`PROCESSING`のResponseフィールド名
 - 409系ユーザー向け具体文言
+
+### 10.1 Phase 8 Wave 0-A：共通認証・セキュリティ実装方針（2026-10-13）
+
+- MVPは単一Spring Bootインスタンスを前提とし、HTTP Sessionはアプリケーションメモリで管理する。スケールアウト時には共有Sessionを再検討する。
+- Spring SecurityのCSRF保護は有効とし、CSRFトークンはHTTP Sessionへ保存する。状態変更リクエストではトークンを検証する。フロントへの取得・送信経路は当該機能実装前に確定する。
+- Session Cookieは `HttpOnly=true`、本番HTTPS環境では `Secure=true`、`SameSite=Lax` を基本とする。本番画面とAPIは同一オリジンで配信する方針。ローカル別ポート利用時はCORS・Cookie・CSRFを動作検証する。
+- ログイン成功時はSession IDを更新し、ログアウトは原則POST＋CSRF検証のうえSessionを無効化する。
+- パスワードは平文保存せず、パスワードハッシュ方式、セッション期限、ログイン試行制限の扱いは認証機能着手前に確定する。
+- Spring Boot→AI Serviceは `X-Internal-API-Key` ヘッダー。Spring側設定名 `ai-service.api-key`、環境変数 `AI_SERVICE_API_KEY`。未設定は起動時に検出し、AI Service側で不一致を401として拒否する。
+- APIキーは環境変数／秘密情報管理から供給し、ソース・レスポンス・ログ（ヘッダー全体を含む）に出力しない。内部接続のみとし、暗号化された通信経路等の保護は実行環境に応じて検討する。MVPでは自動ローテーションを設けない。
+- PostgreSQL制約違反を業務エラーへ変換する際は、制約名・SQLSTATE・操作経路を踏まえて分類する。`uq_organizations_sibling_name` → ユーザー操作時の `409 / ORGANIZATION_CONFLICT`、`uq_ai_processes_reorganize_processing` → 再整理開始時の `409 / ACTIVE_LIMIT_EXCEEDED` が主な候補。ただしAI結果反映中のDB競合は既存仕様どおりROLLBACK後 `FAILED` とし、一律に409へ変換しない。CHECK/FK違反の扱いは発生経路に応じた対応表を実装前に作る。
 
 ## 11. 最終レビュー確認事項
 
@@ -427,3 +438,10 @@ Responseでは、少なくとも次の情報を区別して返す。
 Phase 6のバックエンド構成詳細設計中に、Phase 2〜4でMVP対象として定義されていた検索機能がPhase 5 API基本設計で具体化されていないことを確認した。
 
 PO判断により、`GET /memos/search?q={keyword}`、タイトル・原文・`CURRENT`のorganization名を対象とした部分一致検索、`AI_SUGGESTED`／未確定再整理提案を検索対象外とする方針をPhase 5補足として追加した。
+### Wave 0-A 最終レビュー補足：制約違反の応答区分
+
+- organizationの作成・名前変更・移動で同名一意制約違反：`409 / ORGANIZATION_CONFLICT`。
+- organization削除時に子・メモ関連の外部キーRESTRICT違反：削除阻害理由を再取得可能なら `409 / ORGANIZATION_DELETE_NOT_ALLOWED`。理由の特定ができない競合は共通例外方針に従い分類する。
+- 再整理開始で同一memoのPROCESSING部分一意インデックス違反：`409 / ACTIVE_LIMIT_EXCEEDED`。
+- AI結果反映中のDB競合は既存方針を優先し、ROLLBACK後にAI処理をFAILEDとする。
+- 固有の制約名・SQLSTATEと上記の対応はFlyway V1作成時に確定し、統合テストで確認する。

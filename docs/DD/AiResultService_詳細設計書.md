@@ -176,7 +176,7 @@ MVPの正規化：
 
 同一親配下では重複不可。別親配下では同名を許可する。
 
-ルートorganizationは `parent_id = NULL` のままとし、ルート専用のDB一意制約によって同一ユーザー内の `normalized_name` 重複を禁止する。
+ルートorganizationは `parent_id = NULL` のままとし、PostgreSQL 17の単一制約 `UNIQUE NULLS NOT DISTINCT (user_id, parent_id, normalized_name)` によってルートと子階層の `normalized_name` 重複を防止する。
 
 子organizationは、同一ユーザー・同一 `parent_id`・同一 `normalized_name` の重複をDB一意制約で禁止する。
 
@@ -688,6 +688,32 @@ MVPでは `ai_processes.user_id` は追加しない。
 
 ---
 
+### 13.1 Phase 8 Wave 0-A：未確定提案用JSONB内部DTO
+
+AI ServiceのResponse DTOとは分離し、`AiResultService`による検証・正規化後に次の内部モデルを `ai_processes.proposed_result` (`JSONB`) へ保存する。
+
+```java
+public record ProposedResult(
+    List<ProposedOrganization> organizations,
+    List<ProposedMemoAssignment> assignments
+) {}
+
+public record ProposedOrganization(
+    String nodeKey,
+    Long organizationId,
+    String name,
+    List<ProposedOrganization> children
+) {}
+
+public record ProposedMemoAssignment(String nodeKey) {}
+```
+
+- `organizations` はルートからの階層構造、`assignments` は今回のメモの所属先を指す別配列であり複数所属可。`nodeKey` は提案JSON内で一意な参照キーで、既存・新規ノードの両方に付与し、DBの `organizationId` とは区別する。
+- 既存ノードには解決済み `organizationId` を設定し、新規候補はNULLとする。ユーザー確定前に新規organizationを作成しない。既存ノードの `name`・提案内の階層は表示上のsnapshotであり、採用をもって既存organizationの名称変更・親移動を行わない。
+- `nodeKey`の非空・長さ上限・提案内一意性、`assignments`のキー存在・重複、所属先最低1件、childrenの循環・階層深度・件数上限、名称の正規化・長さ上限・同階層重複を実装前にバリデーション仕様として確定する。AI応答は非信頼入力であり、保存前に検証する。
+- 採用時は既存IDの存在・ログインユーザー所有を再検証する。提案作成後の既存organization名・親の変更のみを理由として即時に拒否しない、という既存方針を維持する。
+- `ProposedResult`はHibernate JSONマッピングを第一候補とし、Spring Boot 4.1.1／Hibernate／Jacksonの組合せでEntity起動、保存、再取得、SQL NULL化をWave 1冒頭に実測する。カスタムFormatMapperは失敗が再現した場合のみ代替検討する。
+
 ## 14. 実装時に固定しない事項
 
 - 各Javaメソッドの最終的な引数型・戻り値型
@@ -695,8 +721,8 @@ MVPでは `ai_processes.user_id` は追加しない。
 - Repositoryの具体的なSQL / JPQL
 - JPAによる悲観ロック・タイムアウト指定方法
 - organization一意制約・部分一意インデックスの具体的SQL表現
-- DTOクラスの最終名称
+- DTOの実装パッケージとバリデーション上限値（提案保存用内部DTOの構成・フィールドは§13.1で確定）
 - AI処理開始専用トランザクション単位の最終クラス名
 - 上位ユースケース層の最終クラス名
-- `proposed_result` DTO / JSONの具体的フィールド名（ただし既存organizationはID、新規はIDなしの区別を維持）
+- `proposed_result` のJSONシリアライズ／Hibernateマッピング方式の実DB検証（内部JSONフィールドは§13.1を正とする）
 - 409系のユーザー向け具体的表示文言

@@ -57,7 +57,7 @@ erDiagram
 - パスワードは8文字以上64文字以下とする。
 - スペースだけの入力は認めない。
 - 英字・数字・記号の組み合わせは強制しない。
-- 認証方式はSession＋Cookieとし、セッション自体の保持方法はPhase 6で具体化する。
+- 認証方式はSession＋Cookieとする。Phase 8 Wave 0-Aにおいて、MVPの単一Spring BootインスタンスではSessionをアプリケーションメモリに保存する方針を確定した。共有Sessionは将来のスケールアウト時に再検討する。
 
 ### 5.2 `memos`
 
@@ -82,7 +82,7 @@ erDiagram
   - 未判断REORGANIZE提案：対応する `ai_processes.created_at` を基準とする（`proposed_at` はFIFO専用で、outdated判定には使用しない）。
   - AI由来CURRENT（INITIAL由来、またはREORGANIZE提案をそのまま採用）：CURRENT行の `ai_process_id` で対応する `ai_processes.created_at` を基準とする。
   - 手動CURRENT（通常変更、「変更して使う」）：`ai_process_id = NULL` とし、CURRENT行の `created_at` を確定時刻として基準にする。
-  - ユーザーが手動で確定したCURRENT：そのCURRENTの確定時刻を基準とする。具体的な保持・取得方式は物理設計で確定する。
+  - 手動CURRENTの確定時刻は上記CURRENT行の `created_at` を採用する。DB時刻源とJPA採番経路は§10.1に従う。
 
 ### 5.3 `organizations`
 
@@ -102,8 +102,7 @@ erDiagram
 - 親子は同一ユーザーに属さなければならない。
 - `normalized_name` は名称の前後空白を除去して小文字化した値とする。Java実装では `toLowerCase(Locale.ROOT)` を使用し、全角半角等の追加正規化はMVP対象外。
 - 同一ユーザー・同一親配下では `normalized_name` が同じorganizationを禁止する。
-- ルートorganizationは `parent_id = NULL` のままとし、同一ユーザー内のルート `normalized_name` 重複をDB制約で禁止する。
-- 子organizationは `(user_id, parent_id, normalized_name)` 相当のDB一意制約で重複を禁止する。
+- ルートorganizationは `parent_id = NULL` のままとし、子階層も含めてPostgreSQL 17の単一制約 `UNIQUE NULLS NOT DISTINCT (user_id, parent_id, normalized_name)` で同一ユーザー・同一親配下の重複を禁止する。ルート専用の別制約は設けない。
 - organizationを複数新規作成する場合は親→子、同一階層では `normalized_name ASC` の決定的な順序で作成する。
 - 自分自身および自分の子孫を移動先に指定できない。
 - 子organizationまたは削除を妨げる関連が残っている場合は削除できない。
@@ -142,8 +141,8 @@ erDiagram
 | 対象メモID | `memo_id` | No | `memos.id`への外部キー。`ON DELETE SET NULL`。メモ削除後はNULL |
 | 処理種別 | `process_type` | Yes | `INITIAL` / `REORGANIZE` |
 | 状態 | `status` | Yes | `PROCESSING` / `COMPLETED` / `FAILED` / `CANCELLED` |
-| 未確定再整理結果 | `proposed_result` | No | REORGANIZE成功時の未確定提案をJSON形式で保持。既存organizationは `organizationId` で参照し、新規organizationはIDなしとして区別する。判断後はNULL。INITIALでは使用しない |
-| 提案保存日時 | `proposed_at` | No | `proposed_result`保存時に設定し、未判断提案のFIFO順序に使用 |
+| 未確定再整理結果 | `proposed_result` | No | PostgreSQL `JSONB`。REORGANIZE成功時の未確定提案を内部DTO構造で保持。既存organizationは `organizationId` で参照し、新規organizationはIDなし。判断後はSQL NULL。INITIALでは使用しない |
+| 提案保存日時 | `proposed_at` | No | REORGANIZE提案の保存時に設定。未判断提案のFIFO順序に使用し、採用・変更・却下で `proposed_result` をSQL NULLにした後も履歴として保持 |
 | エラー情報 | `error_message` | No | 内部向け失敗概要。機密情報やmemo本文を含めない |
 | 作成日時 | `created_at` | Yes | AI処理レコード作成日時。残留PROCESSING判定およびAI入力本文のoutdated基準時刻に使用 |
 | 開始日時 | `started_at` | No | 実装上必要な場合にAI処理開始日時を保持 |
@@ -154,7 +153,7 @@ erDiagram
 
 - AI処理1回につき1レコードを作成し、再試行時も新規レコードを作成する。
 - `PROCESSING` からのみ `COMPLETED / FAILED / CANCELLED` へ遷移し、終端状態から別statusへ遷移しない。
-- `FAILED / CANCELLED` の `proposed_result` はNULL。FAILEDの `proposed_at` もNULLとする。
+- `FAILED / CANCELLED / PROCESSING` の `proposed_result` と `proposed_at` はSQL NULLとする。INITIALではいずれもSQL NULL。REORGANIZEのCOMPLETEDでは提案判断後も `proposed_at` を保持できる。
 - `proposed_result` が非NULLの場合、`process_type = REORGANIZE`、`status = COMPLETED`、`proposed_at IS NOT NULL` を満たす。
 - メモ削除時は `memo_id` を `ON DELETE SET NULL` でNULLにし、`ai_processes` 履歴自体はMVPでは削除しない。
 - AI処理完了時に対象メモが存在しない場合、結果を反映せず `PROCESSING → CANCELLED` とする。
@@ -165,8 +164,8 @@ erDiagram
 - INITIAL / REORGANIZEの `PROCESSING` が残留判定時間（初期値2分）を超えた場合、次回開始時に `FAILED` へ回復する。
 - 状態取得時はタイムアウト判定のみ行い、GET処理ではDB更新しない。
 - AI Serviceへ渡すmemo本文はPROCESSING作成と同じ開始トランザクション内でmemo悲観ロック下に取得し、commit後はそのsnapshotを送信する。
-- 判断対象検索用に `(memo_id, process_type, status, proposed_at, id)` を利用できるインデックスを設ける。
-- 残留回復検索用に `(memo_id, status, created_at)` を利用できるインデックスを設ける。
+- 判断対象検索用に `(memo_id, process_type, status, proposed_at, id) WHERE proposed_result IS NOT NULL` の部分インデックスを設ける。
+- 残留回復検索用に `(memo_id, created_at) WHERE status = 'PROCESSING'` の部分インデックスを設ける。
 - 自動リトライは行わない。
 
 ## 6. 状態遷移
@@ -227,7 +226,7 @@ PROCESSINGから終端状態への更新は `status = PROCESSING` を条件に�
 次の処理を1トランザクションで実行する。
 
 1. `memoId` で絞り込んだ現在の判断対象と `aiProcessId` を照合する。
-2. `proposed_result` の内容と、参照する既存organizationの存在・所有者・現在構造を再検証する。
+2. `proposed_result` の内容と、参照する既存organizationの存在・所有者を再検証し、新規ノードの親として参照する場合はその親が存在することを確認する。既存organizationの名称変更・親変更のみを理由に提案を無効化しない。
 3. 検証失敗時は409とし、`proposed_result`は消費しない。
 4. 必要なorganizationを既存再利用しつつ、親→子、同一階層は `normalized_name ASC` で作成する。
 5. 既存の`CURRENT`を削除する。
@@ -288,15 +287,64 @@ Phase 6で方針を確定し、以下はPhase 7以降で具体実装へ落とし
 - 各カラムの物理型、桁数、デフォルト値および実際のDDL
 - 主キー生成方式
 - `process_type` / `status` のDB表現
-- ルート用・子organization用一意制約の具体的DDL
+- 同階層用単一制約 `uq_organizations_sibling_name` のFlyway DDLと実DB検証
 - `normalized_name` の生成箇所（Javaでは `Locale.ROOT`）
-- `content_updated_at` / `ai_processes.created_at` の物理型・JPA実装方式と、同一の時刻源・精度を保証する具体方式
-- `proposed_result` の物理型・JSON構造
-- 判断対象検索用・残留回復用インデックスの具体DDL
+- outdated関連日時の型・時刻源は `TIMESTAMPTZ(6)`／Java `Instant`／DB `clock_timestamp()`／UTCを採用。JPAでの採番方法と精度は実DBで検証
+- `proposed_result` は `JSONB`、内部DTOは `ProposedResult`／`ProposedOrganization`／`ProposedMemoAssignment`。Hibernate JSONマッピングの保存・取得・SQL NULL化はWave 1冒頭で検証
+- 判断対象検索用・残留回復用部分インデックスは§10補足のDDLを基準とし、Flyway V1で実DB検証。FK用インデックスは検索・削除SQLに照らして追加検討
 - `error_message` 最大500文字・サニタイズの実装
 - `updated_at` / `proposed_at` の更新実装
 - 条件付きUPDATEのRepository実装
-- セッション情報の保存方式
+- セッションはMVPでアプリケーションメモリへ保存。Cookie・CSRF等の具体設定はAPI基本設計のWave 0-A補足を参照
+
+### 10.1 Phase 8 Wave 0-A：PostgreSQL物理設計の確定事項（2026-10-13）
+
+DBMSはPostgreSQL 17とし、Flywayのバージョン付きSQLをDBスキーマの正本とする。JPAのDDL自動生成に依存しない（`ddl-auto=validate`を第一候補とし、実装時検証）。次のSQLはテーブルおよび対象列の作成後に適用するDDL例であり、Flyway V1ではテーブル定義、NOT NULL・値域CHECK、FK、制約名と統合する。
+
+```sql
+ALTER TABLE organizations
+ADD CONSTRAINT uq_organizations_sibling_name
+UNIQUE NULLS NOT DISTINCT (user_id, parent_id, normalized_name);
+
+CREATE UNIQUE INDEX uq_ai_processes_reorganize_processing
+ON ai_processes (memo_id)
+WHERE process_type = 'REORGANIZE' AND status = 'PROCESSING';
+
+ALTER TABLE ai_processes
+ADD CONSTRAINT chk_ai_processes_proposed_at_scope
+CHECK (
+    proposed_at IS NULL
+    OR (process_type = 'REORGANIZE' AND status = 'COMPLETED')
+);
+
+ALTER TABLE ai_processes
+ADD CONSTRAINT chk_ai_processes_proposal_payload
+CHECK (
+    proposed_result IS NULL
+    OR (proposed_at IS NOT NULL AND jsonb_typeof(proposed_result) = 'object')
+);
+
+CREATE INDEX idx_ai_processes_proposal
+ON ai_processes (memo_id, process_type, status, proposed_at, id)
+WHERE proposed_result IS NOT NULL;
+
+CREATE INDEX idx_ai_processes_processing_recovery
+ON ai_processes (memo_id, created_at)
+WHERE status = 'PROCESSING';
+
+CREATE INDEX idx_ai_processes_memo_fk ON ai_processes (memo_id);
+CREATE INDEX idx_memo_organizations_organization_fk ON memo_organizations (organization_id);
+CREATE INDEX idx_organizations_parent_fk ON organizations (parent_id);
+```
+
+- `process_type`・`status`は必ずNOT NULLとし、列値を定義済みenumの値域に制約する。この前提が満たされなければCHECK制約にNULL由来の抜けが生じる。
+- `proposed_result`はSQL NULLまたはJSONオブジェクトのみ許可し、JSONリテラルの`null`を拒否する。JSON内部の妥当性はServiceで検証する。
+- `proposed_at`は未判断の判定フラグではない。未判断判定は `process_type = 'REORGANIZE' AND status = 'COMPLETED' AND proposed_result IS NOT NULL` とする。
+- REORGANIZEのPROCESSING最大1件は部分一意インデックスで最終防御する。アクティブ総数最大2件は従来どおりmemo悲観ロック下のServiceで制御する。INITIAL専用の部分一意インデックスはMVPで追加しない。
+- FK参照側インデックスは `ai_processes(memo_id)`、`memo_organizations(organization_id)`、`organizations(parent_id)` をFlyway V1で追加する。`memo_organizations(memo_id)` は `(memo_id, organization_id, relation_type)` 複合一意制約の先頭列で代替できるため単独インデックスは追加しない。制約名とエラーコードの対応はAPI設計参照。
+- `created_at`・`updated_at`・`content_updated_at`・`proposed_at` の時刻源は `TIMESTAMPTZ(6)`、Java `Instant`、PostgreSQL `clock_timestamp()`を統一採用する。条件付きUPDATE等のバルク更新では監査日時をSQLのSET句で `clock_timestamp()` により明示的に更新し、JPAの自動タイムスタンプ更新には依存しない。AI由来CURRENT・手動CURRENTの比較基準は§5の既存ルールを維持。JPA採番経路はWave 1〜2に実測し、`now()`とJVM時刻を混在させない。同一時刻値による補助表示の検知漏れはMVPの既知制約として許容する。
+- 手動CURRENTで複数所属行がある場合、outdatedの確定時刻には対象CURRENT行の `MAX(created_at)` を使用する（複数行を集約した比較基準）。
+- 主キー生成方式、個別カラム長、JPAマッピングの実動作は引き続き実装時確認事項であり、本節だけで初期DDL全体が完成したことを意味しない。
 
 ## 11. 最終レビュー確認事項
 

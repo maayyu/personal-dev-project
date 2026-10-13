@@ -446,8 +446,8 @@ public record OrganizationResponse(
     Long id,
     String name,
     Long parentId,
-    LocalDateTime createdAt,
-    LocalDateTime updatedAt
+    Instant createdAt,
+    Instant updatedAt
 ) {}
 ```
 
@@ -632,7 +632,10 @@ COMMIT（自ら開始した場合）
 ```text
 BEGIN
   対象organizationの存在・所有者確認
-  名称更新
+  nameからnormalized_nameを再生成
+  同一ユーザー・同一親配下の名称重複を自分自身を除外して確認
+  name・normalized_name更新
+  DB一意制約違反 → 409 / ORGANIZATION_CONFLICT
 COMMIT
 ```
 
@@ -650,7 +653,9 @@ BEGIN
   新しい親の存在・所有者確認
   自分自身指定を確認
   子孫指定による循環発生を確認
+  移動先の同一ユーザー・同一親配下でnormalized_name重複を自分自身を除外して確認
   parent_id更新
+  DB一意制約違反 → 409 / ORGANIZATION_CONFLICT
 COMMIT
 ```
 
@@ -806,7 +811,8 @@ organizationが0件の場合は`200 OK`と空配列を返す。
 - 名称がnull／空白のみ：400
 - 親organizationが存在しない、または他ユーザー所有：404
 - 未認証：401
-- DB保存失敗：500
+- 同一階層の名称重複：409 / `ORGANIZATION_CONFLICT`
+- その他のDB保存失敗：500
 
 ---
 
@@ -837,7 +843,8 @@ organizationが0件の場合は`200 OK`と空配列を返す。
 - 名称がnull／空白のみ：400
 - 対象が存在しない、または他ユーザー所有：404
 - 未認証：401
-- DB更新失敗：500
+- 同一階層の名称重複：409 / `ORGANIZATION_CONFLICT`
+- その他のDB更新失敗：500
 
 ---
 
@@ -881,7 +888,8 @@ organizationが0件の場合は`200 OK`と空配列を返す。
 - 自分自身を指定：409
 - 子孫を指定して循環が発生：409
 - 未認証：401
-- DB更新失敗：500
+- 同一階層の名称重複：409 / `ORGANIZATION_CONFLICT`
+- その他のDB更新失敗：500
 
 ---
 
@@ -1152,9 +1160,20 @@ DB制約だけでは循環を完全には表現できないため、ツリー構
 - 主キー生成方式
 - `created_at`、`updated_at`の物理型と更新方式
 - `user_id`、`parent_id`、`memo_organizations.organization_id`のインデックス
-- ルート用一意制約（同一user・`parent_id IS NULL`・`normalized_name`）のDB製品依存DDL
-- 子階層用一意制約（`user_id, parent_id, normalized_name`）の具体DDL
+- PostgreSQL 17ではルート・子階層を一括で扱う `uq_organizations_sibling_name`（`UNIQUE NULLS NOT DISTINCT (user_id, parent_id, normalized_name)`）を採用する。ルート用／子階層用の独立した2制約は設けない
 - 自己参照外部キーおよび`memo_organizations`外部キーの`ON DELETE RESTRICT`
+
+### 16.2.1 Phase 8 Wave 0-A：PostgreSQL同名制約の具体化
+
+```sql
+ALTER TABLE organizations
+ADD CONSTRAINT uq_organizations_sibling_name
+UNIQUE NULLS NOT DISTINCT (user_id, parent_id, normalized_name);
+```
+
+- `normalized_name` はMVP既定どおり前後空白除去＋Java `toLowerCase(Locale.ROOT)` で生成する。ルート `parent_id=NULL` の重複も同じDB制約で拒否する。
+- Serviceでの重複事前チェックを維持し、制約違反はユーザー操作時に `409 / ORGANIZATION_CONFLICT` として扱う。AI結果反映中のDB競合は従来どおりROLLBACK後にAI処理をFAILEDとする。
+- `organizations.parent_id`と`memo_organizations.organization_id`など参照側FKの索引は実際の検索・削除パターンに基づきFlyway V1で検討する。親子のユーザー所有者一致は既存Service検証を維持し、複合FKの要否は実DBの設計時に別途評価する。
 
 ### 16.3 共通API・画面詳細設計への申し送り
 
