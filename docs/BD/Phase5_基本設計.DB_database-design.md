@@ -1,0 +1,303 @@
+# Phase 5 DB基本設計
+
+## 1. 文書の目的
+
+本書は、「放り込むだけAI整理ツール」のMVPで使用するデータ構造、テーブル間の関係、主要な制約およびデータ整合性ルールを定義する。
+
+本書で定義した論理構造をPhase 6「詳細設計」の入力とする。DB製品に依存する具体的な型、DDL、インデックス名などは、確定済みの制約を維持したうえでPhase 6以降に具体化する。
+
+## 2. 設計方針
+
+- ユーザーごとにメモと整理構造を分離する。
+- メモ原文とAIの整理結果を分離して保持する。
+- 1件のメモを複数のorganizationへ関連付けられるようにする。
+- organizationは親子関係を持つ階層構造とする。
+- AIの初回提案、現在の確定状態、未確定の再整理提案を区別する。
+- 未確定の再整理提案は確定データと分離し、`ai_processes.proposed_result`に保持する。
+- AI処理は実行単位で履歴を保持する。
+- AI処理中でもメモを削除でき、完了後の結果は反映しない。
+
+## 3. ER概要
+
+```mermaid
+erDiagram
+    USERS ||--o{ MEMOS : owns
+    USERS ||--o{ ORGANIZATIONS : owns
+    MEMOS ||--o{ MEMO_ORGANIZATIONS : has
+    ORGANIZATIONS ||--o{ MEMO_ORGANIZATIONS : groups
+    MEMOS o|--o{ AI_PROCESSES : processes
+```
+
+`organizations`は同一テーブルの`parent_id`によって自己参照し、ツリー構造を表現する。
+
+## 4. テーブル一覧
+
+| テーブル | 役割 |
+|---|---|
+| `users` | 利用者と認証に必要な情報を保持する |
+| `memos` | タイトルと原文を含むメモ本体を保持する |
+| `organizations` | ユーザーごとの階層型整理構造を保持する |
+| `memo_organizations` | メモとorganizationの関連および関連種別を保持する |
+| `ai_processes` | AI整理・再整理の実行履歴、状態、および未確定の再整理提案を保持する |
+
+## 5. テーブル定義
+
+### 5.1 `users`
+
+| 論理項目 | カラム | 必須 | 説明 |
+|---|---|---:|---|
+| ユーザーID | `id` | Yes | 主キー |
+| メールアドレス | `email` | Yes | ログイン識別子。ユーザー間で重複不可 |
+| パスワードハッシュ | `password_hash` | Yes | 平文パスワードは保存しない |
+| 作成日時 | `created_at` | Yes | レコード作成日時 |
+| 更新日時 | `updated_at` | Yes | レコード更新日時 |
+
+認証要件は次のとおり。
+
+- パスワードは8文字以上64文字以下とする。
+- スペースだけの入力は認めない。
+- 英字・数字・記号の組み合わせは強制しない。
+- 認証方式はSession＋Cookieとし、セッション自体の保持方法はPhase 6で具体化する。
+
+### 5.2 `memos`
+
+| 論理項目 | カラム | 必須 | 説明 |
+|---|---|---:|---|
+| メモID | `id` | Yes | 主キー |
+| 所有ユーザーID | `user_id` | Yes | `users.id`への外部キー |
+| タイトル | `title` | Yes | ユーザー編集またはAI自動生成による表示名 |
+| 原文 | `content` | Yes | ユーザーが保存した本文。空白・改行のみは不可 |
+| 原文更新日時 | `content_updated_at` | Yes | 原文の最終更新日時。タイトルのみの更新では変更しない |
+| 作成日時 | `created_at` | Yes | レコード作成日時 |
+| 更新日時 | `updated_at` | Yes | レコード更新日時 |
+
+主要ルール：
+
+- AI整理より先にメモを保存する。
+- AI整理に失敗してもメモ原文は保持する。
+- AI処理中もタイトル・原文を編集できる。更新時はmemo悲観ロックを取得し、競合時は409とする。
+- AI処理中に原文が変更されても、返却済み／返却予定のAI結果はMVPでは自動無効化しない。
+- 原文変更時は `content_updated_at` を更新する。タイトルのみの更新では更新しない。
+- 原文変更後も既存の整理結果は自動削除しない。outdated判定は `content_updated_at` と「その整理結果が参照した本文の基準時刻」を比較する。
+  - 未判断REORGANIZE提案：対応する `ai_processes.created_at` を基準とする（`proposed_at` はFIFO専用で、outdated判定には使用しない）。
+  - AI由来CURRENT（INITIAL由来、またはREORGANIZE提案をそのまま採用）：CURRENT行の `ai_process_id` で対応する `ai_processes.created_at` を基準とする。
+  - 手動CURRENT（通常変更、「変更して使う」）：`ai_process_id = NULL` とし、CURRENT行の `created_at` を確定時刻として基準にする。
+  - ユーザーが手動で確定したCURRENT：そのCURRENTの確定時刻を基準とする。具体的な保持・取得方式は物理設計で確定する。
+
+### 5.3 `organizations`
+
+| 論理項目 | カラム | 必須 | 説明 |
+|---|---|---:|---|
+| organization ID | `id` | Yes | 主キー |
+| 所有ユーザーID | `user_id` | Yes | `users.id`への外部キー |
+| 親organization ID | `parent_id` | No | `organizations.id`への自己参照外部キー。ルートはNULL |
+| 名称 | `name` | Yes | 画面に表示する整理項目名 |
+| 正規化名称 | `normalized_name` | Yes | 同名重複判定用。MVPでは前後空白除去＋小文字化 |
+| 作成日時 | `created_at` | Yes | レコード作成日時 |
+| 更新日時 | `updated_at` | Yes | レコード更新日時 |
+
+主要ルール：
+
+- 未確定のAI再整理提案のみを理由としてorganizationを作成しない。再整理提案で新しいorganizationが提示された場合、ユーザーが採用または変更して使用することを確定した時点で作成する。
+- 親子は同一ユーザーに属さなければならない。
+- `normalized_name` は名称の前後空白を除去して小文字化した値とする。Java実装では `toLowerCase(Locale.ROOT)` を使用し、全角半角等の追加正規化はMVP対象外。
+- 同一ユーザー・同一親配下では `normalized_name` が同じorganizationを禁止する。
+- ルートorganizationは `parent_id = NULL` のままとし、同一ユーザー内のルート `normalized_name` 重複をDB制約で禁止する。
+- 子organizationは `(user_id, parent_id, normalized_name)` 相当のDB一意制約で重複を禁止する。
+- organizationを複数新規作成する場合は親→子、同一階層では `normalized_name ASC` の決定的な順序で作成する。
+- 自分自身および自分の子孫を移動先に指定できない。
+- 子organizationまたは削除を妨げる関連が残っている場合は削除できない。
+- 外部キーの削除動作は`RESTRICT`を基本とし、削除可能性は業務ロジックでも検証する。
+
+### 5.4 `memo_organizations`
+
+| 論理項目 | カラム | 必須 | 説明 |
+|---|---|---:|---|
+| メモID | `memo_id` | Yes | `memos.id`への外部キー。`ON DELETE CASCADE` |
+| organization ID | `organization_id` | Yes | `organizations.id`への外部キー |
+| 関連種別 | `relation_type` | Yes | `AI_SUGGESTED`、`CURRENT`のいずれか |
+| AI処理ID | `ai_process_id` | 条件付き | `AI_SUGGESTED`は元INITIALを設定。`CURRENT`はAI由来（INITIAL由来／REORGANIZE提案をそのまま採用）の場合に元AI処理IDを設定し、通常の手動変更／「変更して使う」ではNULLとする |
+| 作成日時 | `created_at` | Yes | レコード作成日時 |
+
+`CURRENT` の `created_at` は、`ai_process_id = NULL` の手動確定CURRENTではoutdated判定の確定時刻として使用する。
+
+主な制約：
+
+- `(memo_id, organization_id, relation_type)`を複合ユニークとする。
+- memo削除時は `ON DELETE CASCADE` により関連する `memo_organizations` を削除し、孤立レコードを残さない。
+- メモとorganizationは同一ユーザーに属さなければならない。
+
+#### 関連種別
+
+| 種別 | 意味 | 更新方針 |
+|---|---|---|
+| `AI_SUGGESTED` | 初回AI整理で提示された整理先 | 初回結果として固定し、再整理では上書きしない |
+| `CURRENT` | 現在ユーザーが採用している正式な整理先 | ユーザー操作または提案採用によって更新する |
+
+### 5.5 `ai_processes`
+
+| 論理項目 | カラム | 必須 | 説明 |
+|---|---|---:|---|
+| AI処理ID | `id` | Yes | 主キー |
+| 対象メモID | `memo_id` | No | `memos.id`への外部キー。`ON DELETE SET NULL`。メモ削除後はNULL |
+| 処理種別 | `process_type` | Yes | `INITIAL` / `REORGANIZE` |
+| 状態 | `status` | Yes | `PROCESSING` / `COMPLETED` / `FAILED` / `CANCELLED` |
+| 未確定再整理結果 | `proposed_result` | No | REORGANIZE成功時の未確定提案をJSON形式で保持。既存organizationは `organizationId` で参照し、新規organizationはIDなしとして区別する。判断後はNULL。INITIALでは使用しない |
+| 提案保存日時 | `proposed_at` | No | `proposed_result`保存時に設定し、未判断提案のFIFO順序に使用 |
+| エラー情報 | `error_message` | No | 内部向け失敗概要。機密情報やmemo本文を含めない |
+| 作成日時 | `created_at` | Yes | AI処理レコード作成日時。残留PROCESSING判定およびAI入力本文のoutdated基準時刻に使用 |
+| 開始日時 | `started_at` | No | 実装上必要な場合にAI処理開始日時を保持 |
+| 完了日時 | `completed_at` | No | 実装上必要な場合に終端状態の確定日時を保持 |
+| 更新日時 | `updated_at` | Yes | 状態等の最終更新日時 |
+
+主要ルール：
+
+- AI処理1回につき1レコードを作成し、再試行時も新規レコードを作成する。
+- `PROCESSING` からのみ `COMPLETED / FAILED / CANCELLED` へ遷移し、終端状態から別statusへ遷移しない。
+- `FAILED / CANCELLED` の `proposed_result` はNULL。FAILEDの `proposed_at` もNULLとする。
+- `proposed_result` が非NULLの場合、`process_type = REORGANIZE`、`status = COMPLETED`、`proposed_at IS NOT NULL` を満たす。
+- メモ削除時は `memo_id` を `ON DELETE SET NULL` でNULLにし、`ai_processes` 履歴自体はMVPでは削除しない。
+- AI処理完了時に対象メモが存在しない場合、結果を反映せず `PROCESSING → CANCELLED` とする。
+- REORGANIZEの未判断提案は最大2件まで保持し、`proposed_at ASC, id ASC` のFIFOで判断する。
+- REORGANIZEの `PROCESSING` は同一memoにつき最大1件とする。
+- REORGANIZEのアクティブ総数は、非タイムアウトの `PROCESSING` と `COMPLETED + proposed_resultあり` を合わせて最大2件とする。
+- INITIALはREORGANIZEのアクティブ上限に含めない。
+- INITIAL / REORGANIZEの `PROCESSING` が残留判定時間（初期値2分）を超えた場合、次回開始時に `FAILED` へ回復する。
+- 状態取得時はタイムアウト判定のみ行い、GET処理ではDB更新しない。
+- AI Serviceへ渡すmemo本文はPROCESSING作成と同じ開始トランザクション内でmemo悲観ロック下に取得し、commit後はそのsnapshotを送信する。
+- 判断対象検索用に `(memo_id, process_type, status, proposed_at, id)` を利用できるインデックスを設ける。
+- 残留回復検索用に `(memo_id, status, created_at)` を利用できるインデックスを設ける。
+- 自動リトライは行わない。
+
+## 6. 状態遷移
+
+```mermaid
+stateDiagram-v2
+    [*] --> PROCESSING
+    PROCESSING --> COMPLETED
+    PROCESSING --> FAILED
+    PROCESSING --> CANCELLED
+```
+
+`COMPLETED / FAILED / CANCELLED` は終端状態とする。
+
+PROCESSINGから終端状態への更新は `status = PROCESSING` を条件に含む条件付きUPDATEを基本とし、更新件数1件を確認する。すでに終端状態であれば上書きしない。
+
+## 7. 主要なデータ更新ルール
+
+### 7.1 初回AI整理
+
+1. `memos`へ原文を保存する。
+2. コミット後、開始処理専用の短いトランザクションでmemo悲観ロックを取得する。
+3. 所有者確認、CURRENT不存在確認、残留PROCESSING回復、開始条件確認後、`process_type = INITIAL / status = PROCESSING` の `ai_processes` を作成する。
+4. commit・ロック解放後にAI Serviceへ依頼する。
+5. AI結果反映時に再度memo悲観ロックを取得し、CURRENTがまだ存在しないことを確認する。
+6. CURRENTが存在しなければ、AI結果を検証し、`AI_SUGGESTED`と初回の`CURRENT`を登録して `COMPLETED` とする。
+7. AI処理中にユーザーが手動でCURRENTを設定していた場合は、ユーザー確定内容を優先し、INITIAL結果を反映せず `CANCELLED` とする。
+8. 結果反映前にmemoが削除済みの場合も、404にはせず結果を反映せず `CANCELLED` とする。
+
+初回AI整理が成功するまで`CURRENT`が存在しない状態を許容する。
+
+### 7.2 初回AI整理の再試行
+
+対象メモに`CURRENT`が存在しない場合に、`POST /memos/{id}/organize` から `INITIAL` として再試行する。
+
+- 残留INITIAL PROCESSINGは開始時に回復する。
+- CURRENTが既に存在する場合は再試行を拒否する。
+- 成功時は初回整理と同じルールで `AI_SUGGESTED` と `CURRENT` を登録する。
+- 再試行でも `proposed_result` は使用しない。
+
+### 7.3 再整理
+
+本フローは、対象メモに`CURRENT`が既に存在することを前提とする。
+
+1. memo悲観ロック取得後、INITIAL / REORGANIZEの残留PROCESSINGを回復する。
+2. INITIAL PROCESSINGが存在せず、REORGANIZE PROCESSINGが0件、REORGANIZEアクティブ総数が2件未満であることを確認する。
+3. `process_type = REORGANIZE / status = PROCESSING` の新しい `ai_processes` を作成する。
+4. commit・ロック解放後にAI Serviceへ再整理を依頼する。
+5. 成功時は対象レコードの `proposed_result` を保存し、`proposed_at` を設定して `COMPLETED` とする。
+6. 既存の未判断提案は消さず、最大2件まで保持する。
+7. `CURRENT`はユーザー判断まで変更しない。
+8. 未確定提案の段階では`organizations`および`memo_organizations`を変更しない。
+
+### 7.4 AI提案をそのまま採用
+
+対象は、表示時に受け取った `aiProcessId` が、対象memoの現在の判断対象（`proposed_at ASC, id ASC` の先頭）と一致する提案とする。
+
+次の処理を1トランザクションで実行する。
+
+1. `memoId` で絞り込んだ現在の判断対象と `aiProcessId` を照合する。
+2. `proposed_result` の内容と、参照する既存organizationの存在・所有者・現在構造を再検証する。
+3. 検証失敗時は409とし、`proposed_result`は消費しない。
+4. 必要なorganizationを既存再利用しつつ、親→子、同一階層は `normalized_name ASC` で作成する。
+5. 既存の`CURRENT`を削除する。
+6. 提案内の所属先を新しい`CURRENT`として登録する。
+7. 採用元の`proposed_result`をNULLにする。
+
+`AI_SUGGESTED`は初回AI整理の固定記録として変更しない。
+
+### 7.5 AI提案を変更して使用
+
+対象は、表示済み `aiProcessId` が現在の判断対象と一致する提案とする。
+
+1. 判断対象を検証する。
+2. ユーザーが修正した整理先を検証する。
+3. 必要なorganizationを親→子、同一階層は `normalized_name ASC` で作成する。
+4. 既存の`CURRENT`を削除する。
+5. ユーザーが修正した整理先を新しい`CURRENT`として登録する。
+6. 変更元の`proposed_result`をNULLにする。
+
+検証・DB競合で409となった場合は提案を消費しない。
+
+### 7.6 AI提案を使用しない
+
+- 表示済み `aiProcessId` が現在の判断対象と一致することを確認する。
+- 提案内容のorganization妥当性検証は不要とする。
+- `CURRENT`は変更しない。
+- 対象`proposed_result`をNULLにする。
+- `AI_SUGGESTED`は初回整理の記録として独立して保持し、変更しない。
+- 判断対象不一致または未判断提案なしの場合は409とする。
+
+## 8. 削除ルール
+
+| 対象 | 基本方針 |
+|---|---|
+| メモ | AI処理中でも削除可能。削除前に未判断`proposed_result`を全件クリアし、`memo_organizations`は `ON DELETE CASCADE` で削除、`ai_processes.memo_id`は `ON DELETE SET NULL` でNULLにする。`ai_processes`履歴は保持する |
+| organization | 子要素や削除を妨げる関連がある場合は削除不可。DBでは`RESTRICT`を基本とする |
+| ユーザー | MVPのユーザー削除機能は対象外。将来設計時に関連データの扱いを決める |
+
+## 9. トランザクション・競合制御
+
+- トランザクション分離レベルはMVPでは `READ_COMMITTED` を前提とする。
+- AI処理開始は、memo悲観ロック取得から `PROCESSING` 作成までを短い開始専用トランザクションで完結させる。
+- 上位ユースケース層本体には `@Transactional` を付与せず、AI Service通信中にDBトランザクション・memoロックを保持しない。
+- CURRENTを書き換えるすべての経路（通常の整理先変更、INITIAL結果反映、提案採用、「変更して使う」）はmemo悲観ロック下で行う。ロック待ち上限は3秒とする。
+- `CURRENT`の置換、必要なorganization作成、および対象`proposed_result`のNULL化は同一トランザクションで行う。
+- INITIAL反映時はCURRENT不存在を反映直前にも確認し、既にCURRENTがあれば `CANCELLED` とする。
+- memo削除済みで結果反映先が存在しない場合は404にせず、`status = PROCESSING` 条件付きUPDATEで `CANCELLED` とする。
+- PROCESSINGから終端状態への更新は条件付きUPDATE＋更新件数確認を基本とする。
+- organizationの同名重複はアプリ事前検証とDB一意制約の双方で防ぐ。
+- AI結果反映中に一意制約違反、FK違反、デッドロック、DBロックタイムアウトが起きた場合は反映全体をROLLBACKし、内部リトライせず当該AI処理を `FAILED` とする。
+- ユーザーによるorganization編集・提案採用等で同種の競合が起きた場合は409とし、未判断提案は消費しない。
+- memoロック待ち初期値は3秒、PROCESSING残留判定初期値は2分とし、設定値として外出しする。
+
+## 10. Phase 7以降への申し送り
+
+Phase 6で方針を確定し、以下はPhase 7以降で具体実装へ落とし込む。
+
+- 各カラムの物理型、桁数、デフォルト値および実際のDDL
+- 主キー生成方式
+- `process_type` / `status` のDB表現
+- ルート用・子organization用一意制約の具体的DDL
+- `normalized_name` の生成箇所（Javaでは `Locale.ROOT`）
+- `content_updated_at` / `ai_processes.created_at` の物理型・JPA実装方式と、同一の時刻源・精度を保証する具体方式
+- `proposed_result` の物理型・JSON構造
+- 判断対象検索用・残留回復用インデックスの具体DDL
+- `error_message` 最大500文字・サニタイズの実装
+- `updated_at` / `proposed_at` の更新実装
+- 条件付きUPDATEのRepository実装
+- セッション情報の保存方式
+
+## 11. 最終レビュー確認事項
+
+本書は会話内で確認できたPhase 5確定事項を統合した成果物案である。元のPhase 5-1最終版との照合時に、カラム名・必須条件・物理型に差異があれば、元の承認済み設計を優先して修正する。
