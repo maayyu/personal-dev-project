@@ -148,7 +148,7 @@ AND status = PROCESSING
 更新：
 
 - `proposed_result` 保存
-- `proposed_at = 現在時刻`
+- `proposed_at = clock_timestamp()`（DB時刻。SQLを通じて採番）
 - `status = COMPLETED`
 - `error_message = NULL`
 - `updated_at` 更新
@@ -260,7 +260,8 @@ FIFO判定ロジックは本Serviceに集約する。
 
 更新：
 
-- `proposed_result = NULL`
+- `proposed_result = SQL NULL`
+- `proposed_at` は履歴として変更しない
 - `updated_at` 更新
 - `status` は `COMPLETED` のまま
 
@@ -478,7 +479,7 @@ UIではそのまま表示しない。
 
 `updated_at` は永続データ更新時に更新。
 
-`proposed_at` はREORGANIZEのAI提案が `proposed_result` として保存された時点で設定し、FIFOに利用する。
+`proposed_at` はREORGANIZEのAI提案が `proposed_result` として保存された時点で設定し、FIFOに利用する。採用・却下・変更して使う、またはメモ削除に伴う提案クリア後も履歴として保持する。未判断判定は `proposed_result IS NOT NULL` を必須条件とする。
 
 FAILEDはPROCESSINGからのみ遷移し、PROCESSING時点では `proposed_at = NULL` のため、FAILEDの `proposed_at` は常にNULL。
 
@@ -572,14 +573,28 @@ HTTP 409を使用する主なケースでは、APIレスポンスに機械判定
 
 ---
 
+### 16.1 Phase 8 Wave 0-A：DB制約と時刻・ロック実装方針
+
+- `ai_processes.proposed_result` は `JSONB`。SQL NULLとJSON `null`を区別し、DB CHECKにより非NULL値をJSONオブジェクトに限定する。Hibernate JSONマッピングはWave 1冒頭に保存・取得・SQL NULL化を検証する。
+- PostgreSQL 17で `(memo_id) WHERE process_type='REORGANIZE' AND status='PROCESSING'` の部分一意インデックス `uq_ai_processes_reorganize_processing` を採用。REORGANIZEの二重PROCESSING登録をDBでも防ぐ。アクティブ総数は引き続きmemo悲観ロック下でServiceが制御する。INITIAL専用の部分一意インデックスはMVPで見送る。
+- memo悲観ロック待機上限3秒は維持する。JPAのロックタイムアウトヒントをPostgreSQLで2接続により実測し、満たせない場合は同じトランザクション内の `SET LOCAL lock_timeout = '3s'` 等を検討する。SQLSTATE／例外の変換は実測後に確定し、ユーザー操作の409 `LOCK_TIMEOUT`、AI反映時のROLLBACK後 `FAILED` を区別する。
+- `memos.content_updated_at`、`ai_processes.created_at`、手動CURRENTの `memo_organizations.created_at`、`ai_processes.proposed_at`、各対象行の `updated_at` は `TIMESTAMPTZ(6)`・Java `Instant`・DB `clock_timestamp()`で時刻源を統一する。`ai_processes.created_at` は開始トランザクション中のmemoロック取得後、原文snapshotと対応付けて採番する。`now()`やJVM時計を混在させない。JPA経由の具体的採番経路と精度はWave 1〜2に実測する。
+- 未判断提案のFIFO用部分インデックス `idx_ai_processes_proposal` と残留回復用 `idx_ai_processes_processing_recovery` はPhase 5 DB設計§10.1に定義したDDL案を使用する。
+
 ## 17. 実装時に固定しない事項
 
 - 各Javaメソッドの最終シグネチャ
 - Entity / DTO / Optional等の具体的戻り値型
 - RepositoryのSQL / JPQL
   - ただしPROCESSINGから終端状態への更新は `status = PROCESSING` 条件付き更新
-- `updated_at` / `proposed_at` のJPA実装方式
+- `updated_at` / `proposed_at` のJPA実装方式（日時はDB `clock_timestamp()` を基本とし、実DB動作確認が必要）
 - organizationルート一意制約等のDB製品依存DDL
 - ログメッセージの具体的文面
 - 開始処理専用トランザクション単位の最終クラス名
 - 上位ユースケース層の最終クラス名
+### Wave 0-A 最終レビュー補足：時刻の更新経路
+
+- `PROCESSING → COMPLETED / FAILED / CANCELLED` 等の条件付きUPDATEでは、`updated_at = clock_timestamp()` をSQLのSET句に明示する。REORGANIZE提案保存時は `proposed_at = clock_timestamp()` も明示する。
+- `content_updated_at` はメモ原文の変更時だけ更新し、DB時刻を同一トランザクションで取得する。具体的なRepository SQL／JPA経路はWave 1〜2の実DB検証で決定する。
+- JPAのEntity自動更新だけに依存せず、バルクUPDATE後も監査日時が更新されることを確認する。
+- `SET LOCAL lock_timeout` を採用する場合は適用範囲がトランザクション全体である点に留意し、memoロック取得失敗とその他のロック競合を、操作箇所・例外の原因で区別する。

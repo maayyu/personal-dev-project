@@ -27,8 +27,8 @@ Windows 11（ホストOS）
 　│　　├─ .devcontainer/  
 　│　　│　　├─ Dockerfile  
 　│　　│　　└─ devcontainer.json  
-　│　　├─ src/（今後作成）  
-　│　　└─ mvnw（Spring Bootプロジェクト生成後に追加）  
+　│　　├─ src/（作成済み）  
+　│　　└─ mvnw（作成済み）  
 　│  
 　└─ Docker Desktop（WSL2バックエンド）  
 　　　　└─ Dev Container  
@@ -134,6 +134,34 @@ stat /run/guest-services/distro-services/ubuntu.sock: no such file or directory
 ## 9. 今後の変更方針
 
 - **Maven Wrapper（`mvnw`）**：Spring Bootプロジェクト生成後、Linuxコンテナ内での実行権限（execute権限）を確認する。問題があれば `devcontainer.json` に `postCreateCommand: "chmod +x mvnw"` を追加する。
-- **DB構成**：DBをコンテナ化するか（docker-composeによるマルチコンテナ構成）は未確定。DB設計フェーズで改めて検討する。
-- **AWS CLI等の追加ツール**：AWSデプロイフェーズ（Phase 9想定）に至った時点で、Dockerfileへの追加を検討する。
+- **DB構成**：Phase 8 Wave 0-Aで、既存Dev Containerを維持し、PostgreSQL 17のみDocker Composeで起動するA案を確定した。詳細は§10参照。
+- **AWS CLI等の追加ツール**：AWSデプロイフェーズ（Phase 11想定）に至った時点で、Dockerfileへの追加を検討する。
 - **ESLint拡張機能の原因調査**：現時点では未対応。原因（依存関係によるものか、その他か）が判明次第、本ドキュメントに追記する。
+
+## 10. Phase 8 Wave 0-A：DB・開発環境の実装方針（2026-10-13）
+
+### 10.1 開発用PostgreSQL
+
+- 既存のJava 21 Dev Container／Maven Wrapper環境は変更せず、PostgreSQL 17を別のDocker Composeサービスで管理する（A案）。
+- Composeはホスト側のターミナルから実行し、PostgreSQLのポートを `127.0.0.1:5432:5432` にバインドする方針。Dev Containerからの接続には `host.docker.internal:5432` を第一候補とし、実際の接続可否を検証する。
+- Composeファイルの配置候補はプロジェクトルートの `compose.yaml` とし、サービス名は `db`、イメージは `postgres:17` を採用する。名前付きVolume `postgres_data` で永続化し、`pg_isready` によるhealthcheckを設ける。具体的なCompose設定はWave 1で作成・実測する。
+- 第一候補の `host.docker.internal:5432` で疎通しない場合は、Dev ContainerをComposeネットワークへ接続する代替を検討する。
+- PostgreSQLのデータは名前付きDocker Volumeに保存し、DBパスワードは環境変数などから渡す。`.env`等の本物の秘密情報はGitに保存しない。共有するのはダミー値のみの `.env.example` とする。
+- AI Serviceは後続の実装時にComposeへの追加を検討する。MVPの開発用Spring Boot自身は既存Dev Containerから起動する。
+
+### 10.2 DB変更管理・テスト
+
+- DBスキーマの正本はFlywayのバージョン付きSQL。適用済みSQLは原則書き換えず、新しいバージョンを追加する。ただし未共有・ローカルDB破棄可能な初期段階に限りV1修正を許容する。
+- Hibernate自動DDL生成に依存せず、`spring.jpa.hibernate.ddl-auto=validate` を第一候補としてEntityとの整合性を検証する。
+- PostgreSQL固有のJSONB、`UNIQUE NULLS NOT DISTINCT`、部分インデックス、CHECK、ロックなどは実PostgreSQLで検証する。Testcontainersを第一候補とし、Dev ContainerからDockerに接続可能か実測する。JUnit・Mockitoとの使い分けはテスト実装段階で学習・確定する。
+- Spring Boot 4.1.1対応のJPA、PostgreSQLドライバ、Flyway、Security、Validation、Testcontainersの依存関係は、採用する正確なartifact名と互換性を確認したうえで追加する。
+- Wave 1では `hibernate.jdbc.time_zone=UTC` を設定候補として追加し、Java `Instant` とPostgreSQL `TIMESTAMPTZ(6)` の読み書きを確認する。DB時刻は `clock_timestamp()` を採用し、バルクUPDATEでは `updated_at` 等をSQLで更新する。
+- Wave 1の早期にHibernate JSONマッピングによる保存・再取得・SQL NULL化を検証する。memoロック依存実装前には2接続による3秒待ちの実測を行う。
+
+### 10.3 設定とセキュリティ
+
+- 本番のフロントエンドとSpring Boot APIは同一オリジンで配信する方針。ローカル別ポート利用時はCookie／CSRF／CORS設定を個別に検証する。
+- Spring Boot→AI Serviceの内部APIキーは環境変数 `AI_SERVICE_API_KEY` で提供し、`X-Internal-API-Key` へ付与する。キーをソースコード・ログに出さない。
+- GitとFlywayの役割の違い：GitはSQLファイルの変更履歴、FlywayはDBへの適用履歴（`flyway_schema_history`）と未適用SQLの実行、PostgreSQLは実体データ・スキーマを管理する。GitHubにSQLをpushしただけではDBには適用されない。
+
+※本節は**採用済み方針**を記録するもので、Compose・Flyway・Testcontainers・JSONBの動作確認が済んだという意味ではない。
