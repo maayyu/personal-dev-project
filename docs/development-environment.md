@@ -165,3 +165,21 @@ stat /run/guest-services/distro-services/ubuntu.sock: no such file or directory
 - GitとFlywayの役割の違い：GitはSQLファイルの変更履歴、FlywayはDBへの適用履歴（`flyway_schema_history`）と未適用SQLの実行、PostgreSQLは実体データ・スキーマを管理する。GitHubにSQLをpushしただけではDBには適用されない。
 
 ※本節は**採用済み方針**を記録するもので、Compose・Flyway・Testcontainers・JSONBの動作確認が済んだという意味ではない。
+
+## 11. Phase 8 Wave 1：実PostgreSQLテストの実行方法
+
+現在のWindows 11＋Docker Desktop（WSL2）＋VS Code Dev Container環境では、Docker Desktopを起動し、Dev Container内のターミナルでプロジェクトルートから次を実行する。
+
+```bash
+TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal ./mvnw test
+```
+
+このコマンドは、Testcontainersが起動するコンテナへの接続先ホストを、実行中だけ`host.docker.internal`に指定する。TestcontainersはDev Container内からホスト側のDockerを利用する。初回の`./mvnw test`では接続先が`172.17.0.1`と自動判定され、後片付け用コンテナRyukへの接続が拒否された。このホスト指定を付けて再実行し、実PostgreSQLテストの成功を確認した。Docker APIへ接続できることと、起動したコンテナの公開ポートへ接続できることは別の確認になる。
+
+- 環境変数の指定はこのコマンドとその子プロセスに適用され、Dev Containerの設定ファイルは変更しない。VS Codeのテストボタンなど、このコマンドを経由しない起動には引き継がれない。
+- このホスト補正は現在のDocker Desktop環境向けの手順。LinuxホストやCIでは、それぞれのDocker構成に応じた接続先を使用する。
+- テストは`postgres:17-alpine`の使い捨てコンテナを起動する。開発用ComposeのDB・Volumeは使用しないため、開発用PostgreSQLを起動する必要はない。
+- `@ServiceConnection`でJDBCとFlywayをテストコンテナへ接続し、FlywayのMigration適用後にHibernateの`ddl-auto=validate`でEntityと照合する。コンテナはテスト終了時に破棄される。
+- 初回はDockerイメージの取得に時間がかかることがある。
+
+参考：[Testcontainers公式：Dockerコンテナ内でのテスト実行とDocker Desktop向けホスト指定](https://java.testcontainers.org/supported_docker_environment/continuous_integration/dind_patterns/)。

@@ -3,12 +3,14 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    }
+  },
   "customizations": {
     "vscode": {
-      "extensions": [
-        "vscjava.vscode-java-pack",
-        "vmware.vscode-boot-dev-pack"
-      ]
+      "extensions": ["vscjava.vscode-java-pack", "vmware.vscode-boot-dev-pack"]
     }
   },
   "forwardPorts": [8080],
