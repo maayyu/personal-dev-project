@@ -57,6 +57,7 @@ erDiagram
 - パスワードは8文字以上64文字以下とする。
 - スペースだけの入力は認めない。
 - 英字・数字・記号の組み合わせは強制しない。
+- 登録・ログイン時のメールアドレスは、前後空白除去後に `toLowerCase(Locale.ROOT)` で小文字化して保存・検索する。DBの`UNIQUE(email)`は維持し、小文字CHECKは追加しない。DBへの直接書込では大小文字違いの重複を防げない（MVPの既知制約）。
 - 認証方式はSession＋Cookieとする。Phase 8 Wave 0-Aにおいて、MVPの単一Spring BootインスタンスではSessionをアプリケーションメモリに保存する方針を確定した。共有Sessionは将来のスケールアウト時に再検討する。
 
 ### 5.2 `memos`
@@ -99,19 +100,20 @@ erDiagram
 主要ルール：
 
 - 未確定のAI再整理提案のみを理由としてorganizationを作成しない。再整理提案で新しいorganizationが提示された場合、ユーザーが採用または変更して使用することを確定した時点で作成する。
-- 親子は同一ユーザーに属さなければならない。
+- 親子は同一ユーザーに属さなければならない。Phase 8 Wave 1ではServiceによる所有者検証に加え、`UNIQUE(id, user_id)` と `(parent_id, user_id)` → `organizations(id, user_id)` の複合FKでも検証する。
 - `normalized_name` は名称の前後空白を除去して小文字化した値とする。Java実装では `toLowerCase(Locale.ROOT)` を使用し、全角半角等の追加正規化はMVP対象外。
 - 同一ユーザー・同一親配下では `normalized_name` が同じorganizationを禁止する。
 - ルートorganizationは `parent_id = NULL` のままとし、子階層も含めてPostgreSQL 17の単一制約 `UNIQUE NULLS NOT DISTINCT (user_id, parent_id, normalized_name)` で同一ユーザー・同一親配下の重複を禁止する。ルート専用の別制約は設けない。
 - organizationを複数新規作成する場合は親→子、同一階層では `normalized_name ASC` の決定的な順序で作成する。
 - 自分自身および自分の子孫を移動先に指定できない。
-- 子organizationまたは削除を妨げる関連が残っている場合は削除できない。
+- 子organizationまたは削除を妨げる関連が残っている場合は削除できない。`AI_SUGGESTED`参照も削除を妨げる関連に含める。APIは409を返し、UIでは理由と関連メモを表示する。
 - 外部キーの削除動作は`RESTRICT`を基本とし、削除可能性は業務ロジックでも検証する。
 
 ### 5.4 `memo_organizations`
 
 | 論理項目 | カラム | 必須 | 説明 |
 |---|---|---:|---|
+| 関連ID | `id` | Yes | 独立主キー。`memo_organizations_id_seq`で採番 |
 | メモID | `memo_id` | Yes | `memos.id`への外部キー。`ON DELETE CASCADE` |
 | organization ID | `organization_id` | Yes | `organizations.id`への外部キー |
 | 関連種別 | `relation_type` | Yes | `AI_SUGGESTED`、`CURRENT`のいずれか |
@@ -122,7 +124,7 @@ erDiagram
 
 主な制約：
 
-- `(memo_id, organization_id, relation_type)`を複合ユニークとする。
+- `id`を独立主キーとし、`(memo_id, organization_id, relation_type)`を業務上の複合ユニークとする。
 - memo削除時は `ON DELETE CASCADE` により関連する `memo_organizations` を削除し、孤立レコードを残さない。
 - メモとorganizationは同一ユーザーに属さなければならない。
 
@@ -344,7 +346,55 @@ CREATE INDEX idx_organizations_parent_fk ON organizations (parent_id);
 - FK参照側インデックスは `ai_processes(memo_id)`、`memo_organizations(organization_id)`、`organizations(parent_id)` をFlyway V1で追加する。`memo_organizations(memo_id)` は `(memo_id, organization_id, relation_type)` 複合一意制約の先頭列で代替できるため単独インデックスは追加しない。制約名とエラーコードの対応はAPI設計参照。
 - `created_at`・`updated_at`・`content_updated_at`・`proposed_at` の時刻源は `TIMESTAMPTZ(6)`、Java `Instant`、PostgreSQL `clock_timestamp()`を統一採用する。条件付きUPDATE等のバルク更新では監査日時をSQLのSET句で `clock_timestamp()` により明示的に更新し、JPAの自動タイムスタンプ更新には依存しない。AI由来CURRENT・手動CURRENTの比較基準は§5の既存ルールを維持。JPA採番経路はWave 1〜2に実測し、`now()`とJVM時刻を混在させない。同一時刻値による補助表示の検知漏れはMVPの既知制約として許容する。
 - 手動CURRENTで複数所属行がある場合、outdatedの確定時刻には対象CURRENT行の `MAX(created_at)` を使用する（複数行を集約した比較基準）。
-- 主キー生成方式、個別カラム長、JPAマッピングの実動作は引き続き実装時確認事項であり、本節だけで初期DDL全体が完成したことを意味しない。
+- 主キー生成方式・個別カラム長はPhase 8 Wave 1で確定した（§10.2）。JPAマッピングの実動作は引き続き検証事項。
+
+
+### 10.2 Phase 8 Wave 1：初期DDLの物理仕様・レビュー確定事項（2026-10-17）
+
+本節はPhase 5の論理設計に対する実装時の確定追記である。**DBスキーマの実装正本はFlyway `V1__create_initial_tables.sql`** とし、本節はその設計根拠を記録する。SQL自体の実DB実行は未検証。
+
+#### 主キー・採番方式
+
+- 5テーブルすべての`id`は`BIGINT`主キーとする（`memo_organizations.id`を含む）。
+- テーブルごとに専用SEQUENCE（`users_id_seq`、`memos_id_seq`、`organizations_id_seq`、`memo_organizations_id_seq`、`ai_processes_id_seq`）を設け、`INCREMENT BY 1`、`DEFAULT nextval(...)`、`OWNED BY`を指定する。
+- JPAは `GenerationType.SEQUENCE`、`@SequenceGenerator(sequenceName=..., allocationSize=1)`を予定する。実動作・`ddl-auto=validate`との整合はWave 1で検証する。
+
+#### 文字列等の物理型
+
+| テーブル | カラム | 型 |
+|---|---|---|
+| `users` | `email`, `password_hash` | `VARCHAR(255)` |
+| `memos` | `title` | `VARCHAR(255)` |
+| `memos` | `content` | `TEXT` |
+| `organizations` | `name`, `normalized_name` | `VARCHAR(255)` |
+| `memo_organizations` | `relation_type` | `VARCHAR(20)` |
+| `ai_processes` | `process_type`, `status` | `VARCHAR(20)` |
+| `ai_processes` | `error_message` | `VARCHAR(500)` |
+| `ai_processes` | `proposed_result` | `JSONB` |
+
+日時カラムは既存方針に従い`TIMESTAMPTZ(6)`を使用し、DB時刻源は`clock_timestamp()`とする。
+
+#### FK・UNIQUE・CHECKと削除仕様
+
+- `organizations`の親子所有者一致は、`uq_organizations_id_user UNIQUE(id, user_id)`および`fk_organizations_parent_owner FOREIGN KEY(parent_id, user_id) REFERENCES organizations(id, user_id) ON DELETE RESTRICT`で保護する。親なしのルートでは`parent_id`がNULLとなる。Service側の所有者確認も維持する。
+- `uq_organizations_sibling_name UNIQUE NULLS NOT DISTINCT(user_id, parent_id, normalized_name)`を維持する。
+- `memo_organizations`は単独主キー`id`に加え`uq_memo_organizations_assignment UNIQUE(memo_id, organization_id, relation_type)`を維持する。`AI_SUGGESTED`参照が残るorganizationは削除できず、`fk_memo_organizations_organization`は`ON DELETE RESTRICT`を維持する。
+- `users.email`はJava側で前後空白除去・小文字化するが、DBでは`UNIQUE(email)`のみとし、lowercase CHECKは今回設けない。
+- V1追加CHECK：`chk_memos_content_nonblank`、`chk_organizations_parent_not_self`、`chk_organizations_name_nonblank`、`chk_organizations_normalized_name_nonblank`、`chk_memo_organizations_relation_type`、`chk_memo_organizations_ai_suggested_source`、`chk_ai_processes_type`、`chk_ai_processes_status`。既存の提案関連CHECK 2本も維持。
+- 非空白CHECKのPOSIX `[:space:]` とJavaの文字判定はUnicode全域で一致しない可能性があり、全角空白等は入力検証・境界値テストで確認する。
+
+#### インデックス構成
+
+- §10.1に記載のAI処理用部分インデックス3本（うち1本はUNIQUE）とFK用3本は維持する。
+- `idx_memos_user_fk ON memos(user_id)`を追加採用する。
+- `idx_organizations_user_fk`は同階層UNIQUEの先頭列で代替できるため作成しない。`idx_memo_organizations_ai_process_fk`もMVPでは作成しない。
+
+#### 後続実装・検証事項
+
+- `memo_organizations`のメモとorganizationの所有者一致、ツリー循環防止、email正規化はService・入力検証・結合テストで担保する。
+- HibernateのINSERTでDB DEFAULTを利用し、生成日時を取得できるかWave 1で実測する。JVM時刻や`current_timestamp`との混在は避ける。
+- CURRENTの置換はDELETE/INSERTのflush順序によるUNIQUE違反をテストし、REORGANIZE完了時の`status`・`proposed_result`・`proposed_at`は同じUPDATEで変更する。
+- Flyway適用とPostgreSQL 17での制約・削除動作検証は未完了。
 
 ## 11. 最終レビュー確認事項
 
