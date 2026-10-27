@@ -8,6 +8,9 @@
       "moby": false
     }
   },
+  "containerEnv": {
+    "TESTCONTAINERS_HOST_OVERRIDE": "host.docker.internal"
+  },
   "customizations": {
     "vscode": {
       "extensions": ["vscjava.vscode-java-pack", "vmware.vscode-boot-dev-pack"]
