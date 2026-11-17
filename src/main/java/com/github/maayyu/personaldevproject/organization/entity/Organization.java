@@ -1,6 +1,7 @@
 package com.github.maayyu.personaldevproject.organization.entity;
 
 import java.time.Instant;
+import java.util.Objects;
 
 import org.hibernate.annotations.Generated;
 import org.hibernate.generator.EventType;
@@ -45,7 +46,7 @@ public class Organization {
     private Instant createdAt;
 
     @Generated(event = EventType.INSERT)
-    @Column(name = "updated_at", nullable = false, insertable = false, updatable = false)
+    @Column(name = "updated_at", nullable = false, insertable = false)
     private Instant updatedAt;
 
     protected Organization() {
@@ -56,6 +57,19 @@ public class Organization {
         this.parentId = parentId;
         this.name = name;
         this.normalizedName = normalizedName;
+    }
+
+    public void rename(String name, String normalizedName) {
+        this.name = name;
+        this.normalizedName = normalizedName;
+    }
+
+    public void changeParent(Long parentId) {
+        this.parentId = parentId;
+    }
+
+    public void markUpdated(Instant dbTime) {
+        this.updatedAt = Objects.requireNonNull(dbTime);
     }
 
     public Long getId() {
